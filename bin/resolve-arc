@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Launch DaVinci Resolve with H.265 decoding on an Intel Arc GPU (VAAPI adapter).
+#
+# - Validates the adapter (pixel-exact decode against Resolve's own FFmpeg) once
+#   per combination of adapter build, Resolve, decode-backend FFmpeg, libva and
+#   the Intel media driver; later launches skip the check until one changes.
+# - If validation fails or the adapter is missing, starts stock Resolve instead.
+# - Rollback: run /opt/resolve/bin/resolve directly, or install.sh --uninstall.
+set -uo pipefail
+ARC=/path/to/arc-decode   # rewritten by install.sh
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/resolve-arc
+mkdir -p "$STATE"
+LOG=$STATE/launcher.log
+exec >>"$LOG" 2>&1
+echo "=== $(date -Is) resolve-arc $*"
+
+ARGS=("$@")
+stock() { echo "Starting stock Resolve: $1"; cd /opt/resolve && exec /opt/resolve/bin/resolve "${ARGS[@]}"; }
+notify() { command -v notify-send >/dev/null && notify-send -a "DaVinci Resolve" "Arc decoding" "$1" || true; }
+lib_path() { ldconfig -p 2>/dev/null | awk -v n="$1" '$1==n && /x86-64/ {print $NF; exit}'; }
+
+# Give a closing Resolve time to exit; a genuine second launch behaves like stock.
+for _ in $(seq 30); do pgrep -f '^/opt/resolve/bin/resolve' >/dev/null || break; sleep 1; done
+if pgrep -f '^/opt/resolve/bin/resolve' >/dev/null; then stock "Resolve already running"; fi
+[[ -f $ARC/launch.sh && -f $ARC/libresolve_arc.so && -f $ARC/libarc_namespace.so ]] || { notify "Adapter files missing; using software decoding."; stock "adapter missing"; }
+
+if [[ -z ${RESOLVE_ARC_DEVICE:-} ]]; then
+    for node in /dev/dri/renderD*; do
+        [[ $(cat "/sys/class/drm/$(basename -- "$node")/device/vendor" 2>/dev/null) == 0x8086 ]] && { RESOLVE_ARC_DEVICE=$node; break; }
+    done
+fi
+[[ -n ${RESOLVE_ARC_DEVICE:-} ]] || { notify "No Intel GPU found; using software decoding."; stock "no Intel render node"; }
+export RESOLVE_ARC_DEVICE
+
+if [[ -f $ARC/ffmpeg/lib/libavcodec.so.62 ]]; then
+    ff=("$ARC/ffmpeg/lib/libavcodec.so.62" "$ARC/ffmpeg/lib/libavutil.so.60" "$ARC/ffmpeg/lib/libswscale.so.9")
+else
+    ff=("$(lib_path libavcodec.so.62)" "$(lib_path libavutil.so.60)" "$(lib_path libswscale.so.9)")
+fi
+ihd=""
+drvpath=${LIBVA_DRIVERS_PATH:-}
+for d in ${drvpath//:/ } /usr/lib/x86_64-linux-gnu/dri /usr/lib64/dri /usr/lib/dri /usr/local/lib/dri; do
+    [[ -e $d/iHD_drv_video.so ]] && { ihd=$d/iHD_drv_video.so; break; }
+done
+key=$( { echo "$RESOLVE_ARC_DEVICE"; stat -Lc '%n %s %Y' \
+    "$ARC/libresolve_arc.so" "$ARC/libarc_namespace.so" "$ARC/download-mode.txt" \
+    /opt/resolve/bin/resolve /opt/resolve/libs/libavcodec.so.60 /opt/resolve/libs/libavutil.so.58 \
+    "${ff[@]}" "$(lib_path libva.so.2)" "$(lib_path libva-drm.so.2)" "${ihd:-/missing-iHD}"; } 2>&1 | sha256sum | cut -d' ' -f1)
+
+if [[ $(cat "$STATE/validated" 2>/dev/null) != "$key" ]]; then
+    echo "Validating adapter for this library/driver set on $RESOLVE_ARC_DEVICE..."
+    read -r mode _ < "$ARC/download-mode.txt"
+    clip=$(head -n1 "$ARC/preflight-clip.txt" 2>/dev/null)
+    if env RESOLVE_ARC_DOWNLOAD="${mode:-vpp}" RESOLVE_ARC_PIPELINE="${RESOLVE_ARC_PIPELINE:-4}" \
+           RESOLVE_ARC_GETBUFFER="${RESOLVE_ARC_GETBUFFER:-1}" \
+           python3 "$ARC/decode-test.py" ${clip:+"$clip"} --hardware --defer-context; then
+        echo "$key" > "$STATE/validated"
+    else
+        notify "Adapter validation failed after an update; using software decoding. See $LOG"
+        stock "validation failed"
+    fi
+fi
+
+cd "$ARC" && RESOLVE_ARC_SKIP_PREFLIGHT=1 exec bash "$ARC/launch.sh" "${ARGS[@]}"

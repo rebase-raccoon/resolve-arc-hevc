@@ -1,0 +1,12 @@
+# Build output
+*.o
+*.so
+arc-decode/ffmpeg/
+arc-decode/.ffmpeg-build-*/
+# Per-machine state written by install.sh and the launcher
+arc-decode/logs/
+arc-decode/preflight-clip.txt
+__pycache__/
+*.pyc
+# Release tarballs are attached to GitHub Releases, not committed
+*.tar.gz
